@@ -22,3 +22,6 @@ Thumbs.db
 outputs/
 *.pdf
 
+# Claude Code auto memory
+.claude/
+
