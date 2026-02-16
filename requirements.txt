@@ -1,1 +1,17 @@
+# Core dependencies for Cin7 API Client
+requests>=2.31.0
+python-dotenv>=1.0.0
 
+# Streamlit app dependencies
+streamlit>=1.31.0
+
+# Data processing (optional for now, but useful)
+pandas>=2.1.0
+openpyxl>=3.1.0  # Required for reading Excel files
+
+# PDF generation
+xhtml2pdf>=0.2.13  # HTML/CSS to PDF, Windows-friendly
+
+# Charts and visualizations (optional)
+# plotly>=5.18.0
+# matplotlib>=3.8.0
