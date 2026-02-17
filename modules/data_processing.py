@@ -5,7 +5,7 @@ Processes raw Cin7 API data into health check metrics and insights.
 Each function corresponds to a section of the health check report.
 """
 
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from typing import Dict, List, Any, Optional, Tuple
 from collections import defaultdict
 import logging
@@ -118,34 +118,42 @@ def process_sales_metrics(
     cutoff = (today - timedelta(days=365)).isoformat()
 
     def _sale_date(s):
-        return s.get('SaleOrderDate') or s.get('OrderDate') or ''
+        return s.get('OrderDate') or ''
 
-    # Apply 365-day cutoff and exclude completed/voided
+    # Apply 365-day cutoff and exclude completed/voided.
+    # Records with no date are included — can't confirm they're outside the window.
     active_sales = [
         s for s in sales_data
         if s.get('Status') not in ('COMPLETED', 'VOIDED')
-        and _sale_date(s) >= cutoff
+        and (_sale_date(s) == '' or _sale_date(s) >= cutoff)
     ]
 
     # Compute dashboard status counts client-side
     computed_counts = {
-        'draft_quotes': len([s for s in active_sales if s.get('QuoteStatus') == 'DRAFT']),
-        'pending_orders': len([s for s in active_sales if s.get('OrderStatus') == 'DRAFT']),
+        'draft_quotes': len([s for s in active_sales if s.get('QuoteStatus') == 'DRAFT' and s.get('OrderStatus') == 'DRAFT']),
+        'pending_orders': len([s for s in sales_data if s.get('Status') in ('DRAFT', 'ORDERING', 'ESTIMATED')]),
         'backordered': len([s for s in active_sales if s.get('Status') == 'BACKORDERED']),
         'awaiting_fulfilment': len([
-            s for s in active_sales
-            if s.get('OrderStatus') == 'AUTHORISED'
-            and s.get('CombinedShippingStatus') in ('NOT SHIPPED', 'PARTIALLY SHIPPED')
+            s for s in sales_data  # no date cutoff — UI shows all historical
+            if s.get('FulFilmentStatus') in ('NOT FULFILLED', 'PARTIALLY FULFILLED')
+            and s.get('Status') not in ('COMPLETED', 'VOIDED')
         ]),
         'orders_to_bill': len([
-            s for s in active_sales
-            if s.get('OrderStatus') == 'AUTHORISED'
-            and s.get('CombinedInvoiceStatus') in ('NOT AVAILABLE', 'DRAFT')
+            s for s in sales_data  # no date cutoff — UI shows all historical
+            if s.get('OrderStatus') in ('AUTHORISED', 'AUTH_NO_ALLOC', 'FULFILLED')
+            and s.get('CombinedPaymentStatus') == 'UNPAID'
+            and s.get('CombinedInvoiceStatus') not in ('INVOICED', 'PARTIALLY INVOICED', 'INVOICED / CREDITED')
+            and s.get('Status') not in ('COMPLETED', 'VOIDED')
+            and s.get('QuoteStatus') != 'DRAFT'
+            and s.get('CreditNoteStatus') != 'AUTHORISED'
         ]),
-        'authorised_quotes_no_so': len([
-            s for s in active_sales
+        'awaiting_approval': len([
+            s for s in sales_data  # includes 365-day cutoff; UI may show ~1 more due to internal logic
             if s.get('QuoteStatus') == 'AUTHORISED'
             and s.get('OrderStatus') == 'NOT AVAILABLE'
+            and s.get('Status') not in ('COMPLETED', 'VOIDED', 'INVOICED')
+            and s.get('CombinedInvoiceStatus') != 'INVOICED'
+            and (s.get('OrderDate') or '') >= (date.today() - timedelta(days=365)).isoformat()
         ]),
     }
 
@@ -182,25 +190,29 @@ def process_sales_metrics(
         period_start = date(today.year, today.month, 1).isoformat()
 
     # Auth SOs from prior periods, not fulfilled
+    # Excludes records fully picked+packed (in shipping queue) — UI omits those
     authorised_prior_not_fulfilled = [
         s for s in active_sales
-        if s.get('OrderStatus') == 'AUTHORISED'
+        if s.get('OrderStatus') in ('AUTHORISED', 'AUTH_NO_ALLOC')
         and s.get('FulFilmentStatus') in ('NOT FULFILLED', 'PARTIALLY FULFILLED')
+        and not (s.get('CombinedPickingStatus') == 'PICKED'
+                 and s.get('CombinedPackingStatus') == 'PACKED')
         and _sale_date(s) < period_start
     ]
 
-    # Fulfilled SOs not invoiced
+    # Fulfilled SOs not invoiced (shipped but not yet invoiced, within 365-day window)
     fulfilled_not_invoiced = [
         s for s in active_sales
-        if s.get('FulFilmentStatus') == 'FULFILLED'
-        and s.get('CombinedInvoiceStatus') in ('NOT AVAILABLE', 'DRAFT')
+        if s.get('CombinedShippingStatus') == 'SHIPPED'
+        and s.get('CombinedInvoiceStatus') == 'NOT INVOICED'
     ]
 
-    # Invoiced SOs not fulfilled
+    # Invoiced SOs not fully fulfilled (within 365-day window)
+    # Includes service orders (FulFilmentStatus=NOT AVAILABLE) and physical orders (NOT FULFILLED)
     invoiced_not_fulfilled = [
         s for s in active_sales
-        if s.get('CombinedInvoiceStatus') in ('AUTHORISED', 'PAID')
-        and s.get('FulFilmentStatus') in ('NOT FULFILLED', 'PARTIALLY FULFILLED')
+        if s.get('CombinedInvoiceStatus') == 'INVOICED'
+        and s.get('FulFilmentStatus') not in ('FULFILLED', 'PARTIALLY FULFILLED')
     ]
 
     metrics['anomalies'] = {
@@ -259,25 +271,28 @@ def process_purchase_metrics(
     today = date.today()
     cutoff = (today - timedelta(days=365)).isoformat()
 
-    # Apply 365-day cutoff and exclude completed/voided
+    # Apply 365-day cutoff and exclude completed/voided.
+    # Records with no date are included — can't confirm they're outside the window.
     active_purchases = [
         p for p in purchases_data
         if p.get('Status') not in ('COMPLETED', 'VOIDED')
-        and (p.get('OrderDate') or '') >= cutoff
+        and ((p.get('OrderDate') or '') == '' or (p.get('OrderDate') or '') >= cutoff)
     ]
 
     # Compute dashboard status counts client-side
     computed_counts = {
-        'draft': len([p for p in active_purchases if p.get('Status') == 'DRAFT']),
-        'awaiting_approval': len([p for p in active_purchases if p.get('Status') == 'ORDERING']),
+        'draft': len([p for p in active_purchases if p.get('OrderStatus') == 'DRAFT']),
         'billing': len([
-            p for p in active_purchases
-            if p.get('OrderStatus') == 'AUTHORISED' and p.get('InvoiceStatus') == 'DRAFT'
+            p for p in purchases_data  # no date cutoff — UI shows all historical
+            if p.get('OrderStatus') == 'AUTHORISED'
+            and p.get('CombinedInvoiceStatus') in ('NOT INVOICED', 'PARTIALLY INVOICED')
+            and p.get('Status') != 'VOIDED'
         ]),
         'awaiting_delivery': len([
-            p for p in active_purchases
+            p for p in purchases_data  # no date cutoff — UI shows all historical
             if p.get('OrderStatus') == 'AUTHORISED'
             and p.get('CombinedReceivingStatus') in ('NOT RECEIVED', 'PARTIALLY RECEIVED')
+            and p.get('Status') not in ('COMPLETED', 'VOIDED')
         ]),
     }
 
@@ -311,21 +326,28 @@ def process_purchase_metrics(
     else:
         period_start = date(today.year, today.month, 1).isoformat()
 
-    # All authorised POs (base set for all anomaly metrics)
-    authorised = [p for p in active_purchases if p.get('OrderStatus') == 'AUTHORISED']
+    # 12-month lookback window (UI applies this to anomaly metrics)
+    period_dt = date(report_year or today.year, report_month or today.month, 1)
+    lookback_start = (period_dt - timedelta(days=365)).isoformat()
 
-    # Auth POs from prior periods, not invoiced
+    # Auth POs from prior periods, not invoiced (12-month lookback, inclusive field filter)
     prior_not_invoiced = [
-        p for p in authorised
-        if p.get('CombinedInvoiceStatus') in ('NOT INVOICED', 'PARTIALLY INVOICED')
-        and (p.get('OrderDate') or '') < period_start
+        p for p in purchases_data
+        if p.get('Status') in ('ORDERED', 'ORDERING', 'RECEIVED', 'RECEIVING')
+        and p.get('InvoiceStatus') in ('DRAFT', 'NOT AVAILABLE')
+        and p.get('CombinedInvoiceStatus') in ('', 'NOT AVAILABLE', 'NOT INVOICED', 'PARTIALLY INVOICED')
+        and p.get('OrderStatus') != 'NOT AVAILABLE'
+        and lookback_start <= (p.get('OrderDate') or '') < period_start
     ]
 
-    # Auth POs from prior periods, not received
+    # Auth POs from prior periods, not received (12-month lookback, inclusive field filter)
     prior_not_received = [
-        p for p in authorised
-        if p.get('CombinedReceivingStatus') in ('NOT RECEIVED', 'PARTIALLY RECEIVED')
-        and (p.get('OrderDate') or '') < period_start
+        p for p in purchases_data
+        if p.get('Status') in ('INVOICED', 'ORDERED', 'ORDERING', 'PARTIALLY INVOICED', 'RECEIVING')
+        and p.get('OrderStatus') in ('AUTHORISED', 'DRAFT')
+        and p.get('InvoiceStatus') in ('AUTHORISED', 'DRAFT', 'NOT AVAILABLE')
+        and p.get('CombinedReceivingStatus') in ('', 'NOT AVAILABLE', 'NOT RECEIVED', 'PARTIALLY RECEIVED')
+        and lookback_start <= (p.get('OrderDate') or '') < period_start
     ]
 
     # Auth POs from current period, not invoiced
