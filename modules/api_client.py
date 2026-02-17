@@ -614,18 +614,19 @@ class Cin7APIClient:
         self,
         sku: Optional[str] = None,
         name: Optional[str] = None,
-        modified_since: Optional[str] = None
+        modified_since: Optional[str] = None,
+        include_deprecated: bool = False
     ) -> List[Dict[str, Any]]:
         """
         Get product master data list.
 
-        Used for data hygiene checks (no price, no category, no supplier).
-        Contains: SKU, Name, Category, PriceTier1-10, Status, AverageCost, etc.
+        Contains: SKU, Name, Category, PriceTier1-10, Status, AverageCost, Barcode, etc.
 
         Args:
             sku: Filter by SKU
             name: Filter by product name
             modified_since: ISO date string
+            include_deprecated: Whether to include deprecated products (default False)
 
         Returns:
             List of products with master data
@@ -637,8 +638,10 @@ class Cin7APIClient:
             params["Name"] = name
         if modified_since:
             params["ModifiedSince"] = modified_since
+        if not include_deprecated:
+            params["IncludeDeprecated"] = "false"
 
-        return self._paginate("/product", params, limit=100)  # Product endpoint may have lower page limit
+        return self._paginate("/product", params, limit=100)
 
     def get_product_availability(
         self,
@@ -691,16 +694,18 @@ class Cin7APIClient:
     def get_customers(
         self,
         name: Optional[str] = None,
-        modified_since: Optional[str] = None
+        modified_since: Optional[str] = None,
+        include_deprecated: bool = False
     ) -> List[Dict[str, Any]]:
         """
         Get customer list.
 
-        Used for data hygiene checks (missing contacts, emails, payment terms).
+        Contacts are in a nested Contacts[] array with Email, Phone, MobilePhone fields.
 
         Args:
             name: Filter by customer name
             modified_since: ISO date string
+            include_deprecated: Whether to include deprecated customers (default False)
 
         Returns:
             List of customers
@@ -710,22 +715,26 @@ class Cin7APIClient:
             params["Name"] = name
         if modified_since:
             params["ModifiedSince"] = modified_since
+        if not include_deprecated:
+            params["IncludeDeprecated"] = "false"
 
         return self._paginate("/customer", params)
 
     def get_suppliers(
         self,
         name: Optional[str] = None,
-        modified_since: Optional[str] = None
+        modified_since: Optional[str] = None,
+        include_deprecated: bool = False
     ) -> List[Dict[str, Any]]:
         """
         Get supplier list.
 
-        Used for data hygiene checks.
+        Contacts are in a nested Contacts[] array with Email, Phone fields.
 
         Args:
             name: Filter by supplier name
             modified_since: ISO date string
+            include_deprecated: Whether to include deprecated suppliers (default False)
 
         Returns:
             List of suppliers
@@ -735,6 +744,8 @@ class Cin7APIClient:
             params["Name"] = name
         if modified_since:
             params["ModifiedSince"] = modified_since
+        if not include_deprecated:
+            params["IncludeDeprecated"] = "false"
 
         return self._paginate("/supplier", params)
 
@@ -790,22 +801,16 @@ class Cin7APIClient:
                 "/saleList",
                 {"QuoteStatus": "AUTHORISED", "OrderStatus": "NOT AVAILABLE"}
             ),
+            "pending_orders": self.get_status_count("/saleList", {"OrderStatus": "DRAFT"}),
             "backordered": self.get_status_count("/saleList", {"Status": "BACKORDERED"}),
-            "awaiting_fulfilment": self.get_status_count(
-                "/saleList",
-                {"OrderStatus": "AUTHORISED", "FulFilmentStatus": "NOT FULFILLED"}
+            # Awaiting fulfilment = authorised SOs not shipped + partially shipped (combined)
+            "awaiting_fulfilment": (
+                self.get_status_count("/saleList", {"OrderStatus": "AUTHORISED", "CombinedShippingStatus": "NOT SHIPPED"})
+                + self.get_status_count("/saleList", {"OrderStatus": "AUTHORISED", "CombinedShippingStatus": "PARTIALLY SHIPPED"})
             ),
             "orders_to_bill": self.get_status_count(
                 "/saleList",
                 {"OrderStatus": "AUTHORISED", "CombinedInvoiceStatus": "NOT AVAILABLE"}
-            ),
-            "fulfilled_not_invoiced": self.get_status_count(
-                "/saleList",
-                {"FulFilmentStatus": "FULFILLED", "CombinedInvoiceStatus": "NOT INVOICED"}
-            ),
-            "invoiced_not_fulfilled": self.get_status_count(
-                "/saleList",
-                {"CombinedInvoiceStatus": "AUTHORISED", "FulFilmentStatus": "NOT FULFILLED"}
             ),
         }
 
@@ -821,23 +826,17 @@ class Cin7APIClient:
         logger.info("Fetching purchase status counts...")
 
         counts = {
-            "draft": self.get_status_count("/purchaseList", {"OrderStatus": "DRAFT"}),
+            "draft": self.get_status_count("/purchaseList", {"Status": "DRAFT"}),
             "authorised": self.get_status_count("/purchaseList", {"OrderStatus": "AUTHORISED"}),
-            "authorised_not_invoiced": self.get_status_count(
+            # Billing = authorised POs with draft invoice
+            "billing": self.get_status_count(
                 "/purchaseList",
-                {"OrderStatus": "AUTHORISED", "CombinedInvoiceStatus": "NOT INVOICED"}
+                {"OrderStatus": "AUTHORISED", "InvoiceStatus": "DRAFT"}
             ),
-            "authorised_not_received": self.get_status_count(
-                "/purchaseList",
-                {"OrderStatus": "AUTHORISED", "CombinedReceivingStatus": "NOT RECEIVED"}
-            ),
-            "fully_invoiced_not_received": self.get_status_count(
-                "/purchaseList",
-                {"CombinedInvoiceStatus": "AUTHORISED", "CombinedReceivingStatus": "NOT RECEIVED"}
-            ),
-            "fully_received_not_invoiced": self.get_status_count(
-                "/purchaseList",
-                {"CombinedReceivingStatus": "RECEIVED", "CombinedInvoiceStatus": "NOT INVOICED"}
+            # Awaiting delivery = authorised POs not yet fully received (two calls combined)
+            "awaiting_delivery": (
+                self.get_status_count("/purchaseList", {"OrderStatus": "AUTHORISED", "CombinedReceivingStatus": "NOT RECEIVED"})
+                + self.get_status_count("/purchaseList", {"OrderStatus": "AUTHORISED", "CombinedReceivingStatus": "PARTIALLY RECEIVED"})
             ),
         }
 

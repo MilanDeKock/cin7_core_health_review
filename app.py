@@ -172,21 +172,31 @@ with st.sidebar:
                 total_sections = sum(sections.values())
                 current = 0
 
-                # Sales
+                # Determine period bounds for date filtering
+                from datetime import date as _date
+                period_start = _date(report_year, report_month, 1).isoformat()
+                if report_month == 12:
+                    period_end = _date(report_year + 1, 1, 1).isoformat()
+                else:
+                    period_end = _date(report_year, report_month + 1, 1).isoformat()
+
+                # Sales — single bulk pull, all counts derived client-side
                 if sections['sales']:
                     with st.spinner("Loading sales data..."):
-                        sales_counts = st.session_state.client.get_sale_status_counts()
                         all_sales = st.session_state.client.get_sale_list()
-                        st.session_state.metrics['sales'] = process_sales_metrics(all_sales, sales_counts)
+                        st.session_state.metrics['sales'] = process_sales_metrics(
+                            all_sales, None, report_year, report_month
+                        )
                     current += 1
                     progress_bar.progress(current / total_sections)
 
-                # Purchases
+                # Purchases — single bulk pull, all counts derived client-side
                 if sections['purchases']:
                     with st.spinner("Loading purchase data..."):
-                        purchase_counts = st.session_state.client.get_purchase_status_counts()
                         all_purchases = st.session_state.client.get_purchase_list()
-                        st.session_state.metrics['purchases'] = process_purchase_metrics(all_purchases, purchase_counts)
+                        st.session_state.metrics['purchases'] = process_purchase_metrics(
+                            all_purchases, None, report_year, report_month
+                        )
                     current += 1
                     progress_bar.progress(current / total_sections)
 
@@ -194,12 +204,16 @@ with st.sidebar:
                 if sections['stock_adjustments']:
                     with st.spinner("Loading stock adjustments..."):
                         adjustments = st.session_state.client.get_stock_adjustments()
-                        # Fetch details for each adjustment (limit to recent ones)
+                        # Filter to only adjustments within the reporting period by EffectiveDate
+                        period_adjs = [
+                            a for a in adjustments
+                            if period_start <= (a.get('EffectiveDate') or a.get('Date') or '')[:10] < period_end
+                        ]
                         adj_details = []
-                        for adj in adjustments[:20]:  # Limit to prevent too many API calls
+                        for adj in period_adjs:
                             detail = st.session_state.client.get_stock_adjustment_detail(adj['TaskID'])
                             adj_details.append(detail)
-                        st.session_state.metrics['stock_adjustments'] = process_stock_adjustments(adjustments, adj_details)
+                        st.session_state.metrics['stock_adjustments'] = process_stock_adjustments(period_adjs, adj_details)
                     current += 1
                     progress_bar.progress(current / total_sections)
 
@@ -207,27 +221,45 @@ with st.sidebar:
                 if sections['stock_takes']:
                     with st.spinner("Loading stock takes..."):
                         stocktakes = st.session_state.client.get_stock_takes()
+                        # Filter to only stocktakes within the reporting period by EffectiveDate
+                        period_takes = [
+                            s for s in stocktakes
+                            if period_start <= (s.get('EffectiveDate') or s.get('Date') or '')[:10] < period_end
+                        ]
                         st_details = []
-                        for st_item in stocktakes[:20]:
+                        for st_item in period_takes:
                             detail = st.session_state.client.get_stock_take_detail(st_item['TaskID'])
                             st_details.append(detail)
-                        st.session_state.metrics['stock_takes'] = process_stock_takes(stocktakes, st_details)
+                        st.session_state.metrics['stock_takes'] = process_stock_takes(
+                            period_takes, st_details, st.session_state.get('products')
+                        )
                     current += 1
                     progress_bar.progress(current / total_sections)
 
-                # Transfers
+                # Transfers — only DRAFT and IN TRANSIT (active, not completed)
                 if sections['transfers']:
                     with st.spinner("Loading transfers..."):
-                        all_transfers = st.session_state.client.get_stock_transfers()
+                        transfers_draft = st.session_state.client.get_stock_transfers(status='DRAFT')
+                        transfers_transit = st.session_state.client.get_stock_transfers(status='IN TRANSIT')
+                        all_transfers = transfers_draft + transfers_transit
                         st.session_state.metrics['transfers'] = process_transfers(all_transfers)
                     current += 1
                     progress_bar.progress(current / total_sections)
 
-                # Assemblies
+                # Assemblies — 3 separate status calls; Production — 4 status calls, Type='O' only
                 if sections['assemblies']:
                     with st.spinner("Loading assemblies & production..."):
-                        assemblies = st.session_state.client.get_finished_goods()
-                        production = st.session_state.client.get_production_orders()
+                        assemblies = (
+                            st.session_state.client.get_finished_goods(status='DRAFT') +
+                            st.session_state.client.get_finished_goods(status='AUTHORISED') +
+                            st.session_state.client.get_finished_goods(status='IN PROGRESS')
+                        )
+                        production = (
+                            st.session_state.client.get_production_orders(status='Draft') +
+                            st.session_state.client.get_production_orders(status='Planned') +
+                            st.session_state.client.get_production_orders(status='Released') +
+                            st.session_state.client.get_production_orders(status='InProgress')
+                        )
                         st.session_state.metrics['assemblies'] = process_assemblies(assemblies)
                         st.session_state.metrics['production'] = process_production_orders(production)
                     current += 1
@@ -240,9 +272,9 @@ with st.sidebar:
                         availability = st.session_state.client.get_product_availability()
                         location_names = [loc.get('Name') for loc in locations]
 
-                        # Load products for cost data (if not already loaded)
+                        # Load products for cost data (exclude deprecated)
                         if 'products' not in st.session_state:
-                            st.session_state.products = st.session_state.client.get_products()
+                            st.session_state.products = st.session_state.client.get_products(include_deprecated=False)
 
                         st.session_state.metrics['stock_availability'] = process_stock_availability(
                             availability, location_names, st.session_state.products
@@ -253,12 +285,13 @@ with st.sidebar:
                 # Data Hygiene
                 if sections['data_hygiene']:
                     with st.spinner("Loading master data for hygiene checks..."):
-                        # Load products if not already loaded
+                        # Load active products (exclude deprecated)
                         if 'products' not in st.session_state:
-                            st.session_state.products = st.session_state.client.get_products()
+                            st.session_state.products = st.session_state.client.get_products(include_deprecated=False)
 
-                        customers = st.session_state.client.get_customers()
-                        suppliers = st.session_state.client.get_suppliers()
+                        # Exclude deprecated customers and suppliers
+                        customers = st.session_state.client.get_customers(include_deprecated=False)
+                        suppliers = st.session_state.client.get_suppliers(include_deprecated=False)
                         st.session_state.metrics['data_hygiene'] = process_data_hygiene(
                             st.session_state.products, customers, suppliers
                         )
@@ -418,13 +451,18 @@ else:
                     st.json(sales['status_counts'])
 
                 st.markdown("**Anomalies:**")
-                col1, col2 = st.columns(2)
+                col1, col2, col3 = st.columns(3)
                 with col1:
+                    st.metric(
+                        "Prior Period Not Fulfilled",
+                        sales['anomalies']['authorised_prior_not_fulfilled']['count']
+                    )
+                with col2:
                     st.metric(
                         "Fulfilled Not Invoiced",
                         sales['anomalies']['fulfilled_not_invoiced']['count']
                     )
-                with col2:
+                with col3:
                     st.metric(
                         "Invoiced Not Fulfilled",
                         sales['anomalies']['invoiced_not_fulfilled']['count']
@@ -439,25 +477,43 @@ else:
                 if purchases['status_counts']:
                     st.json(purchases['status_counts'])
 
-                st.markdown("**Anomalies:**")
+                st.markdown("**Prior Period Anomalies:**")
                 col1, col2 = st.columns(2)
                 with col1:
                     st.metric(
-                        "Authorised Not Invoiced",
-                        purchases['anomalies']['authorised_not_invoiced']['count']
-                    )
-                    st.metric(
-                        "Invoiced Not Received",
-                        purchases['anomalies']['invoiced_not_received']['count']
+                        "Prior Period Not Invoiced",
+                        purchases['anomalies']['prior_not_invoiced']['count']
                     )
                 with col2:
                     st.metric(
-                        "Authorised Not Received",
-                        purchases['anomalies']['authorised_not_received']['count']
+                        "Prior Period Not Received",
+                        purchases['anomalies']['prior_not_received']['count']
                     )
+
+                st.markdown("**Current Period:**")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric(
+                        "Current Period Not Invoiced",
+                        purchases['anomalies']['current_not_invoiced']['count']
+                    )
+                with col2:
+                    st.metric(
+                        "Current Period Not Received",
+                        purchases['anomalies']['current_not_received']['count']
+                    )
+
+                st.markdown("**Cross Anomalies:**")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric(
+                        "Invoiced Not Received",
+                        purchases['anomalies']['fully_invoiced_not_received']['count']
+                    )
+                with col2:
                     st.metric(
                         "Received Not Invoiced",
-                        purchases['anomalies']['received_not_invoiced']['count']
+                        purchases['anomalies']['fully_received_not_invoiced']['count']
                     )
 
         # Stock Adjustments
@@ -493,41 +549,62 @@ else:
 
                 st.markdown(f"**Total Issues Found:** {hygiene['summary']['total_issues']}")
 
-                col1, col2 = st.columns(2)
+                col1, col2, col3 = st.columns(3)
 
                 with col1:
-                    st.markdown("**Products:**")
-                    st.metric("No Price Set", hygiene['summary']['products_no_price'])
-                    st.metric("No Category", hygiene['summary']['products_no_category'])
+                    st.markdown("**Products (Sellable):**")
+                    st.metric("No Retail Price", hygiene['summary']['products_no_price'])
+                    st.metric("No Barcode", hygiene['summary']['products_no_barcode'])
 
                 with col2:
                     st.markdown("**Customers:**")
                     st.metric("Missing Email", hygiene['summary']['customers_missing_email'])
-                    st.metric("Missing Contact Person", len(hygiene['customers']['missing_contact']))
+                    st.metric("Missing Phone", hygiene['summary']['customers_missing_phone'])
+                    st.metric("No Payment Term", hygiene['summary']['customers_missing_payment_terms'])
+                    st.metric("On Credit Hold", hygiene['summary']['customers_on_credit_hold'])
 
-                st.markdown("**Suppliers:**")
-                st.metric("Missing Email", hygiene['summary']['suppliers_missing_email'])
+                with col3:
+                    st.markdown("**Suppliers:**")
+                    st.metric("Missing Email", hygiene['summary']['suppliers_missing_email'])
+                    st.metric("Missing Phone", hygiene['summary']['suppliers_missing_phone'])
+                    st.metric("No Payment Term", hygiene['summary']['suppliers_missing_payment_terms'])
 
-                # Show details if available
+                # Show details
                 if hygiene['products']['no_price']:
-                    with st.expander(f"📦 Products with No Price ({len(hygiene['products']['no_price'])})"):
+                    with st.expander(f"💰 Sellable Products with No Retail Price ({len(hygiene['products']['no_price'])})"):
                         st.dataframe(pd.DataFrame(hygiene['products']['no_price']))
 
-                if hygiene['products']['no_category']:
-                    with st.expander(f"📁 Products with No Category ({len(hygiene['products']['no_category'])})"):
-                        st.dataframe(pd.DataFrame(hygiene['products']['no_category']))
+                if hygiene['products']['no_barcode']:
+                    with st.expander(f"📦 Sellable Products with No Barcode ({len(hygiene['products']['no_barcode'])})"):
+                        st.dataframe(pd.DataFrame(hygiene['products']['no_barcode']))
 
                 if hygiene['customers']['missing_email']:
                     with st.expander(f"👥 Customers Missing Email ({len(hygiene['customers']['missing_email'])})"):
                         st.dataframe(pd.DataFrame(hygiene['customers']['missing_email']))
 
-                if hygiene['customers']['missing_contact']:
-                    with st.expander(f"👥 Customers Missing Contact Person ({len(hygiene['customers']['missing_contact'])})"):
-                        st.dataframe(pd.DataFrame(hygiene['customers']['missing_contact']))
+                if hygiene['customers']['missing_phone']:
+                    with st.expander(f"📞 Customers Missing Phone ({len(hygiene['customers']['missing_phone'])})"):
+                        st.dataframe(pd.DataFrame(hygiene['customers']['missing_phone']))
+
+                if hygiene['customers']['missing_payment_terms']:
+                    with st.expander(f"💳 Customers with No Payment Term ({len(hygiene['customers']['missing_payment_terms'])})"):
+                        st.dataframe(pd.DataFrame(hygiene['customers']['missing_payment_terms']))
+
+                if hygiene['customers']['on_credit_hold']:
+                    with st.expander(f"🚫 Customers on Credit Hold ({len(hygiene['customers']['on_credit_hold'])})"):
+                        st.dataframe(pd.DataFrame(hygiene['customers']['on_credit_hold']))
 
                 if hygiene['suppliers']['missing_email']:
                     with st.expander(f"🏭 Suppliers Missing Email ({len(hygiene['suppliers']['missing_email'])})"):
                         st.dataframe(pd.DataFrame(hygiene['suppliers']['missing_email']))
+
+                if hygiene['suppliers']['missing_phone']:
+                    with st.expander(f"📞 Suppliers Missing Phone ({len(hygiene['suppliers']['missing_phone'])})"):
+                        st.dataframe(pd.DataFrame(hygiene['suppliers']['missing_phone']))
+
+                if hygiene['suppliers']['missing_payment_terms']:
+                    with st.expander(f"💳 Suppliers with No Payment Term ({len(hygiene['suppliers']['missing_payment_terms'])})"):
+                        st.dataframe(pd.DataFrame(hygiene['suppliers']['missing_payment_terms']))
 
     # TAB 3: ANOMALIES
     with tab3:
@@ -538,6 +615,11 @@ else:
         # Sales anomalies
         if 'sales' in st.session_state.metrics:
             sales = st.session_state.metrics['sales']
+            if sales['anomalies']['authorised_prior_not_fulfilled']['count'] > 0:
+                anomaly_count += sales['anomalies']['authorised_prior_not_fulfilled']['count']
+                with st.expander(f"⚠️ Auth SOs from Prior Periods Not Fulfilled ({sales['anomalies']['authorised_prior_not_fulfilled']['count']})", expanded=True):
+                    st.dataframe(sales['anomalies']['authorised_prior_not_fulfilled']['records'])
+
             if sales['anomalies']['fulfilled_not_invoiced']['count'] > 0:
                 anomaly_count += sales['anomalies']['fulfilled_not_invoiced']['count']
                 with st.expander(f"⚠️ Fulfilled Sales Not Invoiced ({sales['anomalies']['fulfilled_not_invoiced']['count']})", expanded=True):
@@ -622,32 +704,35 @@ else:
             if 'sales' in st.session_state.metrics:
                 st.markdown("#### Sales Data")
 
-                # All sales orders
-                if st.button("📥 Download All Sales Orders"):
-                    # We'd need to store the raw API data for this
-                    # For now, we can export the anomalies
-                    pass
-
-                # Fulfilled not invoiced
                 sales = st.session_state.metrics['sales']
+
+                if sales['anomalies']['authorised_prior_not_fulfilled']['records']:
+                    df = pd.DataFrame(sales['anomalies']['authorised_prior_not_fulfilled']['records'])
+                    csv = df.to_csv(index=False)
+                    st.download_button(
+                        "📥 Prior Period Not Fulfilled",
+                        csv,
+                        f"sales_prior_not_fulfilled_{report_period.replace(' ', '_')}.csv",
+                        "text/csv"
+                    )
+
                 if sales['anomalies']['fulfilled_not_invoiced']['records']:
                     df = pd.DataFrame(sales['anomalies']['fulfilled_not_invoiced']['records'])
                     csv = df.to_csv(index=False)
                     st.download_button(
                         "📥 Fulfilled Not Invoiced",
                         csv,
-                        f"fulfilled_not_invoiced_{report_period.replace(' ', '_')}.csv",
+                        f"sales_fulfilled_not_invoiced_{report_period.replace(' ', '_')}.csv",
                         "text/csv"
                     )
 
-                # Invoiced not fulfilled
                 if sales['anomalies']['invoiced_not_fulfilled']['records']:
                     df = pd.DataFrame(sales['anomalies']['invoiced_not_fulfilled']['records'])
                     csv = df.to_csv(index=False)
                     st.download_button(
                         "📥 Invoiced Not Fulfilled",
                         csv,
-                        f"invoiced_not_fulfilled_{report_period.replace(' ', '_')}.csv",
+                        f"sales_invoiced_not_fulfilled_{report_period.replace(' ', '_')}.csv",
                         "text/csv"
                     )
 
@@ -657,27 +742,23 @@ else:
 
                 purchases = st.session_state.metrics['purchases']
 
-                # Authorised not invoiced
-                if purchases['anomalies']['authorised_not_invoiced']['records']:
-                    df = pd.DataFrame(purchases['anomalies']['authorised_not_invoiced']['records'])
-                    csv = df.to_csv(index=False)
-                    st.download_button(
-                        "📥 Authorised Not Invoiced",
-                        csv,
-                        f"pos_authorised_not_invoiced_{report_period.replace(' ', '_')}.csv",
-                        "text/csv"
-                    )
-
-                # Authorised not received
-                if purchases['anomalies']['authorised_not_received']['records']:
-                    df = pd.DataFrame(purchases['anomalies']['authorised_not_received']['records'])
-                    csv = df.to_csv(index=False)
-                    st.download_button(
-                        "📥 Authorised Not Received",
-                        csv,
-                        f"pos_authorised_not_received_{report_period.replace(' ', '_')}.csv",
-                        "text/csv"
-                    )
+                for key, label, filename in [
+                    ('prior_not_invoiced', '📥 Prior Period Not Invoiced', 'pos_prior_not_invoiced'),
+                    ('prior_not_received', '📥 Prior Period Not Received', 'pos_prior_not_received'),
+                    ('current_not_invoiced', '📥 Current Period Not Invoiced', 'pos_current_not_invoiced'),
+                    ('current_not_received', '📥 Current Period Not Received', 'pos_current_not_received'),
+                    ('fully_invoiced_not_received', '📥 Invoiced Not Received', 'pos_invoiced_not_received'),
+                    ('fully_received_not_invoiced', '📥 Received Not Invoiced', 'pos_received_not_invoiced'),
+                ]:
+                    if purchases['anomalies'][key]['records']:
+                        df = pd.DataFrame(purchases['anomalies'][key]['records'])
+                        csv = df.to_csv(index=False)
+                        st.download_button(
+                            label,
+                            csv,
+                            f"{filename}_{report_period.replace(' ', '_')}.csv",
+                            "text/csv"
+                        )
 
         with col2:
             # Stock adjustments
@@ -746,60 +827,28 @@ else:
 
                 hygiene = st.session_state.metrics['data_hygiene']
 
-                # Products with no price
-                if hygiene['products']['no_price']:
-                    df = pd.DataFrame(hygiene['products']['no_price'])
-                    csv = df.to_csv(index=False)
-                    st.download_button(
-                        "📥 Products with No Price",
-                        csv,
-                        f"products_no_price_{report_period.replace(' ', '_')}.csv",
-                        "text/csv"
-                    )
+                hygiene_exports = [
+                    (hygiene['products']['no_price'], "📥 Sellable Products with No Retail Price", "products_no_price"),
+                    (hygiene['products']['no_barcode'], "📥 Sellable Products with No Barcode", "products_no_barcode"),
+                    (hygiene['customers']['missing_email'], "📥 Customers Missing Email", "customers_missing_email"),
+                    (hygiene['customers']['missing_phone'], "📥 Customers Missing Phone", "customers_missing_phone"),
+                    (hygiene['customers']['missing_payment_terms'], "📥 Customers with No Payment Term", "customers_missing_payment_terms"),
+                    (hygiene['customers']['on_credit_hold'], "📥 Customers on Credit Hold", "customers_on_credit_hold"),
+                    (hygiene['suppliers']['missing_email'], "📥 Suppliers Missing Email", "suppliers_missing_email"),
+                    (hygiene['suppliers']['missing_phone'], "📥 Suppliers Missing Phone", "suppliers_missing_phone"),
+                    (hygiene['suppliers']['missing_payment_terms'], "📥 Suppliers with No Payment Term", "suppliers_missing_payment_terms"),
+                ]
 
-                # Products with no category
-                if hygiene['products']['no_category']:
-                    df = pd.DataFrame(hygiene['products']['no_category'])
-                    csv = df.to_csv(index=False)
-                    st.download_button(
-                        "📥 Products with No Category",
-                        csv,
-                        f"products_no_category_{report_period.replace(' ', '_')}.csv",
-                        "text/csv"
-                    )
-
-                # Customers missing email
-                if hygiene['customers']['missing_email']:
-                    df = pd.DataFrame(hygiene['customers']['missing_email'])
-                    csv = df.to_csv(index=False)
-                    st.download_button(
-                        "📥 Customers Missing Email",
-                        csv,
-                        f"customers_missing_email_{report_period.replace(' ', '_')}.csv",
-                        "text/csv"
-                    )
-
-                # Customers missing contact
-                if hygiene['customers']['missing_contact']:
-                    df = pd.DataFrame(hygiene['customers']['missing_contact'])
-                    csv = df.to_csv(index=False)
-                    st.download_button(
-                        "📥 Customers Missing Contact Person",
-                        csv,
-                        f"customers_missing_contact_{report_period.replace(' ', '_')}.csv",
-                        "text/csv"
-                    )
-
-                # Suppliers missing email
-                if hygiene['suppliers']['missing_email']:
-                    df = pd.DataFrame(hygiene['suppliers']['missing_email'])
-                    csv = df.to_csv(index=False)
-                    st.download_button(
-                        "📥 Suppliers Missing Email",
-                        csv,
-                        f"suppliers_missing_email_{report_period.replace(' ', '_')}.csv",
-                        "text/csv"
-                    )
+                for data, label, filename in hygiene_exports:
+                    if data:
+                        df = pd.DataFrame(data)
+                        csv = df.to_csv(index=False)
+                        st.download_button(
+                            label,
+                            csv,
+                            f"{filename}_{report_period.replace(' ', '_')}.csv",
+                            "text/csv"
+                        )
 
         st.markdown("---")
         st.info("💡 **Tip:** These CSV files contain the detailed data behind each metric. Open them in Excel for further analysis, filtering, or reporting.")

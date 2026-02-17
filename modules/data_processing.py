@@ -92,36 +92,81 @@ def calculate_age_days(date_string: str) -> int:
 
 def process_sales_metrics(
     sales_data: List[Dict],
-    status_counts: Optional[Dict[str, int]] = None
+    status_counts: Optional[Dict[str, int]] = None,
+    report_year: Optional[int] = None,
+    report_month: Optional[int] = None
 ) -> Dict[str, Any]:
     """
     Process sales data into health check metrics.
 
+    Status counts are computed client-side from the bulk data (no separate API calls needed).
+    Applies 365-day cutoff and excludes COMPLETED/VOIDED orders.
+
     Args:
-        sales_data: Raw sale list from API
-        status_counts: Pre-calculated status counts (optional, for performance)
+        sales_data: Raw sale list from API (bulk pull)
+        status_counts: Ignored — counts are now computed from bulk data
+        report_year: Report period year (for period-split metrics)
+        report_month: Report period month (for period-split metrics)
 
     Returns:
         Dictionary with sales health check metrics
     """
     logger.info("Processing sales metrics...")
 
+    from datetime import date, timedelta
+    today = date.today()
+    cutoff = (today - timedelta(days=365)).isoformat()
+
+    def _sale_date(s):
+        return s.get('SaleOrderDate') or s.get('OrderDate') or ''
+
+    # Apply 365-day cutoff and exclude completed/voided
+    active_sales = [
+        s for s in sales_data
+        if s.get('Status') not in ('COMPLETED', 'VOIDED')
+        and _sale_date(s) >= cutoff
+    ]
+
+    # Compute dashboard status counts client-side
+    computed_counts = {
+        'draft_quotes': len([s for s in active_sales if s.get('QuoteStatus') == 'DRAFT']),
+        'pending_orders': len([s for s in active_sales if s.get('OrderStatus') == 'DRAFT']),
+        'backordered': len([s for s in active_sales if s.get('Status') == 'BACKORDERED']),
+        'awaiting_fulfilment': len([
+            s for s in active_sales
+            if s.get('OrderStatus') == 'AUTHORISED'
+            and s.get('CombinedShippingStatus') in ('NOT SHIPPED', 'PARTIALLY SHIPPED')
+        ]),
+        'orders_to_bill': len([
+            s for s in active_sales
+            if s.get('OrderStatus') == 'AUTHORISED'
+            and s.get('CombinedInvoiceStatus') in ('NOT AVAILABLE', 'DRAFT')
+        ]),
+        'authorised_quotes_no_so': len([
+            s for s in active_sales
+            if s.get('QuoteStatus') == 'AUTHORISED'
+            and s.get('OrderStatus') == 'NOT AVAILABLE'
+        ]),
+    }
+
     metrics = {
-        'status_counts': status_counts or {},
+        'status_counts': computed_counts,
         'oldest_by_status': {},
         'anomalies': {},
         'summary': {}
     }
 
-    # Group sales by status
+    # Group active sales by OrderStatus for oldest-date tracking
     by_status = defaultdict(list)
-    for sale in sales_data:
-        status = sale.get('Status', 'UNKNOWN')
+    for sale in active_sales:
+        status = sale.get('OrderStatus', sale.get('Status', 'UNKNOWN'))
         by_status[status].append(sale)
 
-    # Find oldest for each status
+    # Use whichever date field the API returns
+    date_field = 'SaleOrderDate' if any(s.get('SaleOrderDate') for s in active_sales[:5]) else 'OrderDate'
+
     for status, sales in by_status.items():
-        oldest = get_oldest_date(sales, 'OrderDate')
+        oldest = get_oldest_date(sales, date_field)
         if oldest:
             metrics['oldest_by_status'][status] = {
                 'order_number': oldest['record'].get('OrderNumber'),
@@ -130,37 +175,57 @@ def process_sales_metrics(
                 'customer': oldest['record'].get('Customer', 'Unknown')
             }
 
-    # Calculate anomalies
-    fulfilled_not_invoiced = [
-        s for s in sales_data
-        if s.get('FulFilmentStatus') == 'FULFILLED'
-        and s.get('CombinedInvoiceStatus') in ['NOT INVOICED', 'NOT AVAILABLE']
+    # Determine period start for prior/current split
+    if report_year and report_month:
+        period_start = date(report_year, report_month, 1).isoformat()
+    else:
+        period_start = date(today.year, today.month, 1).isoformat()
+
+    # Auth SOs from prior periods, not fulfilled
+    authorised_prior_not_fulfilled = [
+        s for s in active_sales
+        if s.get('OrderStatus') == 'AUTHORISED'
+        and s.get('FulFilmentStatus') in ('NOT FULFILLED', 'PARTIALLY FULFILLED')
+        and _sale_date(s) < period_start
     ]
 
+    # Fulfilled SOs not invoiced
+    fulfilled_not_invoiced = [
+        s for s in active_sales
+        if s.get('FulFilmentStatus') == 'FULFILLED'
+        and s.get('CombinedInvoiceStatus') in ('NOT AVAILABLE', 'DRAFT')
+    ]
+
+    # Invoiced SOs not fulfilled
     invoiced_not_fulfilled = [
-        s for s in sales_data
-        if s.get('CombinedInvoiceStatus') == 'AUTHORISED'
-        and s.get('FulFilmentStatus') != 'FULFILLED'
+        s for s in active_sales
+        if s.get('CombinedInvoiceStatus') in ('AUTHORISED', 'PAID')
+        and s.get('FulFilmentStatus') in ('NOT FULFILLED', 'PARTIALLY FULFILLED')
     ]
 
     metrics['anomalies'] = {
+        'authorised_prior_not_fulfilled': {
+            'count': len(authorised_prior_not_fulfilled),
+            'oldest': get_oldest_date(authorised_prior_not_fulfilled, date_field),
+            'records': authorised_prior_not_fulfilled[:10]
+        },
         'fulfilled_not_invoiced': {
             'count': len(fulfilled_not_invoiced),
-            'oldest': get_oldest_date(fulfilled_not_invoiced, 'OrderDate'),
-            'records': fulfilled_not_invoiced[:10]  # Top 10
+            'oldest': get_oldest_date(fulfilled_not_invoiced, date_field),
+            'records': fulfilled_not_invoiced[:10]
         },
         'invoiced_not_fulfilled': {
             'count': len(invoiced_not_fulfilled),
-            'oldest': get_oldest_date(invoiced_not_fulfilled, 'OrderDate'),
+            'oldest': get_oldest_date(invoiced_not_fulfilled, date_field),
             'records': invoiced_not_fulfilled[:10]
         }
     }
 
-    # Summary stats
     metrics['summary'] = {
         'total_sales': len(sales_data),
+        'active_sales': len(active_sales),
         'unique_statuses': len(by_status),
-        'has_anomalies': len(fulfilled_not_invoiced) > 0 or len(invoiced_not_fulfilled) > 0
+        'has_anomalies': any(a['count'] > 0 for a in metrics['anomalies'].values())
     }
 
     return metrics
@@ -172,7 +237,9 @@ def process_sales_metrics(
 
 def process_purchase_metrics(
     purchases_data: List[Dict],
-    status_counts: Optional[Dict[str, int]] = None
+    status_counts: Optional[Dict[str, int]] = None,
+    report_year: Optional[int] = None,
+    report_month: Optional[int] = None
 ) -> Dict[str, Any]:
     """
     Process purchase data into health check metrics.
@@ -180,14 +247,42 @@ def process_purchase_metrics(
     Args:
         purchases_data: Raw purchase list from API
         status_counts: Pre-calculated status counts (optional)
+        report_year: Report period year (for period-split metrics)
+        report_month: Report period month (for period-split metrics)
 
     Returns:
         Dictionary with purchase health check metrics
     """
     logger.info("Processing purchase metrics...")
 
+    from datetime import date, timedelta
+    today = date.today()
+    cutoff = (today - timedelta(days=365)).isoformat()
+
+    # Apply 365-day cutoff and exclude completed/voided
+    active_purchases = [
+        p for p in purchases_data
+        if p.get('Status') not in ('COMPLETED', 'VOIDED')
+        and (p.get('OrderDate') or '') >= cutoff
+    ]
+
+    # Compute dashboard status counts client-side
+    computed_counts = {
+        'draft': len([p for p in active_purchases if p.get('Status') == 'DRAFT']),
+        'awaiting_approval': len([p for p in active_purchases if p.get('Status') == 'ORDERING']),
+        'billing': len([
+            p for p in active_purchases
+            if p.get('OrderStatus') == 'AUTHORISED' and p.get('InvoiceStatus') == 'DRAFT'
+        ]),
+        'awaiting_delivery': len([
+            p for p in active_purchases
+            if p.get('OrderStatus') == 'AUTHORISED'
+            and p.get('CombinedReceivingStatus') in ('NOT RECEIVED', 'PARTIALLY RECEIVED')
+        ]),
+    }
+
     metrics = {
-        'status_counts': status_counts or {},
+        'status_counts': computed_counts,
         'oldest_by_status': {},
         'anomalies': {},
         'summary': {}
@@ -195,7 +290,7 @@ def process_purchase_metrics(
 
     # Group by order status
     by_status = defaultdict(list)
-    for po in purchases_data:
+    for po in active_purchases:
         status = po.get('OrderStatus', 'UNKNOWN')
         by_status[status].append(po)
 
@@ -210,58 +305,95 @@ def process_purchase_metrics(
                 'supplier': oldest['record'].get('SupplierName', oldest['record'].get('Supplier', 'Unknown'))
             }
 
-    # Calculate anomalies
-    authorised_not_invoiced = [
-        p for p in purchases_data
-        if p.get('OrderStatus') == 'AUTHORISED'
-        and p.get('CombinedInvoiceStatus') in ['NOT INVOICED', 'NOT AVAILABLE']
+    # Determine current period start for prior/current split
+    if report_year and report_month:
+        period_start = date(report_year, report_month, 1).isoformat()
+    else:
+        period_start = date(today.year, today.month, 1).isoformat()
+
+    # All authorised POs (base set for all anomaly metrics)
+    authorised = [p for p in active_purchases if p.get('OrderStatus') == 'AUTHORISED']
+
+    # Auth POs from prior periods, not invoiced
+    prior_not_invoiced = [
+        p for p in authorised
+        if p.get('CombinedInvoiceStatus') in ('NOT INVOICED', 'PARTIALLY INVOICED')
+        and (p.get('OrderDate') or '') < period_start
     ]
 
-    authorised_not_received = [
-        p for p in purchases_data
-        if p.get('OrderStatus') == 'AUTHORISED'
-        and p.get('CombinedReceivingStatus') in ['NOT RECEIVED', 'NOT AVAILABLE']
+    # Auth POs from prior periods, not received
+    prior_not_received = [
+        p for p in authorised
+        if p.get('CombinedReceivingStatus') in ('NOT RECEIVED', 'PARTIALLY RECEIVED')
+        and (p.get('OrderDate') or '') < period_start
     ]
 
-    invoiced_not_received = [
-        p for p in purchases_data
-        if p.get('CombinedInvoiceStatus') == 'AUTHORISED'
-        and p.get('CombinedReceivingStatus') != 'RECEIVED'
+    # Auth POs from current period, not invoiced
+    current_not_invoiced = [
+        p for p in authorised
+        if p.get('CombinedInvoiceStatus') in ('NOT INVOICED', 'PARTIALLY INVOICED')
+        and (p.get('OrderDate') or '') >= period_start
     ]
 
-    received_not_invoiced = [
-        p for p in purchases_data
-        if p.get('CombinedReceivingStatus') == 'RECEIVED'
-        and p.get('CombinedInvoiceStatus') not in ['AUTHORISED', 'INVOICED']
+    # Auth POs from current period, not received
+    current_not_received = [
+        p for p in authorised
+        if p.get('CombinedReceivingStatus') in ('NOT RECEIVED', 'PARTIALLY RECEIVED')
+        and (p.get('OrderDate') or '') >= period_start
+    ]
+
+    # Fully invoiced but not fully received
+    fully_invoiced_not_received = [
+        p for p in authorised
+        if p.get('CombinedInvoiceStatus') in ('INVOICED', 'INVOICED / CREDITED')
+        and p.get('CombinedReceivingStatus') in ('NOT RECEIVED', 'PARTIALLY RECEIVED')
+    ]
+
+    # Fully received but not fully invoiced
+    fully_received_not_invoiced = [
+        p for p in authorised
+        if p.get('CombinedReceivingStatus') == 'FULLY RECEIVED'
+        and p.get('CombinedInvoiceStatus') in ('NOT INVOICED', 'PARTIALLY INVOICED')
     ]
 
     metrics['anomalies'] = {
-        'authorised_not_invoiced': {
-            'count': len(authorised_not_invoiced),
-            'oldest': get_oldest_date(authorised_not_invoiced, 'OrderDate'),
-            'records': authorised_not_invoiced[:10]
+        'prior_not_invoiced': {
+            'count': len(prior_not_invoiced),
+            'oldest': get_oldest_date(prior_not_invoiced, 'OrderDate'),
+            'records': prior_not_invoiced[:10]
         },
-        'authorised_not_received': {
-            'count': len(authorised_not_received),
-            'oldest': get_oldest_date(authorised_not_received, 'OrderDate'),
-            'records': authorised_not_received[:10]
+        'prior_not_received': {
+            'count': len(prior_not_received),
+            'oldest': get_oldest_date(prior_not_received, 'OrderDate'),
+            'records': prior_not_received[:10]
         },
-        'invoiced_not_received': {
-            'count': len(invoiced_not_received),
-            'oldest': get_oldest_date(invoiced_not_received, 'OrderDate'),
-            'records': invoiced_not_received[:10]
+        'current_not_invoiced': {
+            'count': len(current_not_invoiced),
+            'oldest': get_oldest_date(current_not_invoiced, 'OrderDate'),
+            'records': current_not_invoiced[:10]
         },
-        'received_not_invoiced': {
-            'count': len(received_not_invoiced),
-            'oldest': get_oldest_date(received_not_invoiced, 'OrderDate'),
-            'records': received_not_invoiced[:10]
+        'current_not_received': {
+            'count': len(current_not_received),
+            'oldest': get_oldest_date(current_not_received, 'OrderDate'),
+            'records': current_not_received[:10]
+        },
+        'fully_invoiced_not_received': {
+            'count': len(fully_invoiced_not_received),
+            'oldest': get_oldest_date(fully_invoiced_not_received, 'OrderDate'),
+            'records': fully_invoiced_not_received[:10]
+        },
+        'fully_received_not_invoiced': {
+            'count': len(fully_received_not_invoiced),
+            'oldest': get_oldest_date(fully_received_not_invoiced, 'OrderDate'),
+            'records': fully_received_not_invoiced[:10]
         }
     }
 
     metrics['summary'] = {
         'total_purchases': len(purchases_data),
+        'active_purchases': len(active_purchases),
         'unique_statuses': len(by_status),
-        'has_anomalies': any(len(a['records']) > 0 for a in metrics['anomalies'].values())
+        'has_anomalies': any(a['count'] > 0 for a in metrics['anomalies'].values())
     }
 
     return metrics
@@ -298,14 +430,15 @@ def process_stock_adjustments(
     }
 
     # Process each detailed adjustment
+    # v2 spec: lines are in NewStockLines with UnitCost field
     all_lines = []
     for detail in adjustment_details:
         location = detail.get('Location', 'Unknown')
-        lines = detail.get('Lines', [])
+        lines = detail.get('NewStockLines') or detail.get('Lines', [])
 
         for line in lines:
             qty = line.get('Quantity', 0)
-            cost = line.get('Cost', 0)
+            cost = line.get('UnitCost') or line.get('Cost', 0)
             total_cost = qty * cost
 
             # Add to location totals
@@ -382,19 +515,32 @@ def process_stock_adjustments(
 
 def process_stock_takes(
     stocktakes: List[Dict],
-    stocktake_details: List[Dict]
+    stocktake_details: List[Dict],
+    products: Optional[List[Dict]] = None
 ) -> Dict[str, Any]:
     """
     Process stock takes and calculate discrepancies.
 
+    Stock take lines do not include cost — cross-reference with product AverageCost.
+
     Args:
         stocktakes: List of stock take summaries
         stocktake_details: List of detailed stocktake records
+        products: Product master data for cost lookup (optional)
 
     Returns:
         Dictionary with stocktake metrics
     """
     logger.info("Processing stock takes...")
+
+    # Build SKU-to-cost lookup from product master data
+    sku_to_cost: Dict[str, float] = {}
+    if products:
+        for p in products:
+            sku = p.get('SKU', '')
+            cost = p.get('AverageCost') or p.get('DefaultCost') or 0
+            if sku:
+                sku_to_cost[sku] = cost
 
     metrics = {
         'total_stocktakes': len(stocktakes),
@@ -412,7 +558,9 @@ def process_stock_takes(
         for product in non_zero_products:
             qty_on_hand = product.get('QuantityOnHand', 0)
             adjustment = product.get('Adjustment', 0)
-            cost = product.get('Cost', 0)
+            sku = product.get('SKU', '')
+            # Cost from Transactions if available, else from product lookup
+            cost = sku_to_cost.get(sku, 0)
 
             if adjustment != 0:  # Only count actual discrepancies
                 cost_impact = adjustment * cost
@@ -422,12 +570,12 @@ def process_stock_takes(
                 metrics['by_location'][location]['cost_impact'] += abs(cost_impact)
 
                 all_discrepancies.append({
-                    'sku': product.get('SKU', 'Unknown'),
+                    'sku': sku or 'Unknown',
                     'name': product.get('Name', 'Unknown'),
                     'location': location,
                     'qty_on_hand': qty_on_hand,
                     'adjustment': adjustment,
-                    'cost': cost,
+                    'unit_cost': cost,
                     'cost_impact': cost_impact,
                     'date': detail.get('Date', 'Unknown')
                 })
@@ -526,11 +674,14 @@ def process_assemblies(assemblies_data: List[Dict]) -> Dict[str, Any]:
 
 
 def process_production_orders(production_data: List[Dict]) -> Dict[str, Any]:
-    """Process production order data"""
+    """Process production order data. Filters to Type='O' (orders only, not runs)."""
     logger.info("Processing production orders...")
 
+    # Filter to production orders only (Type='O'), exclude runs (Type='R')
+    orders_only = [o for o in production_data if o.get('Type') == 'O']
+
     by_status = defaultdict(list)
-    for order in production_data:
+    for order in orders_only:
         status = order.get('Status', 'UNKNOWN')
         by_status[status].append(order)
 
@@ -538,7 +689,7 @@ def process_production_orders(production_data: List[Dict]) -> Dict[str, Any]:
         'status_counts': {status: len(orders) for status, orders in by_status.items()},
         'oldest_by_status': {},
         'records_by_status': {status: orders for status, orders in by_status.items()},
-        'summary': {'total_production_orders': len(production_data)}
+        'summary': {'total_production_orders': len(orders_only)}
     }
 
     return metrics
@@ -657,72 +808,101 @@ def process_data_hygiene(
 
     metrics = {
         'products': {
-            'no_price': [],
-            'no_category': [],
-            'no_supplier': [],
-            'inactive_on_orders': []  # Would need to cross-reference with open orders
+            'no_price': [],     # Sellable products with no retail price
+            'no_barcode': [],   # Sellable products with no barcode
         },
         'customers': {
             'missing_email': [],
-            'missing_contact': [],
-            'missing_payment_terms': []
+            'missing_phone': [],
+            'missing_payment_terms': [],
+            'on_credit_hold': [],
         },
         'suppliers': {
             'missing_email': [],
-            'missing_contact': []
+            'missing_phone': [],
+            'missing_payment_terms': [],
         },
         'summary': {}
     }
 
-    # Check products
+    # Check products — only sellable items
     for product in products:
         sku = product.get('SKU', 'Unknown')
         name = product.get('Name', 'Unknown')
         is_sellable = product.get('Sellable', False)
 
-        # No price set (only check sellable products)
         if is_sellable:
-            has_price = any(
-                product.get(f'PriceTier{i}', 0) > 0
-                for i in range(1, 11)
-            )
+            # No retail price set
+            has_price = any(product.get(f'PriceTier{i}', 0) > 0 for i in range(1, 11))
             if not has_price:
                 metrics['products']['no_price'].append({'sku': sku, 'name': name})
 
-        # No category
-        if not product.get('Category'):
-            metrics['products']['no_category'].append({'sku': sku, 'name': name})
+            # No barcode
+            if not product.get('Barcode'):
+                metrics['products']['no_barcode'].append({'sku': sku, 'name': name})
 
     # Check customers
+    # NOTE: Contacts are in a nested 'Contacts' array, NOT top-level fields
     if customers:
         for customer in customers:
             name = customer.get('Name', 'Unknown')
+            contacts = customer.get('Contacts', []) or []
 
-            if not customer.get('Email'):
+            has_email = any(c.get('Email') for c in contacts)
+            has_phone = any(c.get('Phone') or c.get('MobilePhone') for c in contacts)
+
+            if not has_email:
                 metrics['customers']['missing_email'].append({'name': name})
 
-            if not customer.get('ContactPerson'):
-                metrics['customers']['missing_contact'].append({'name': name})
+            if not has_phone:
+                metrics['customers']['missing_phone'].append({'name': name})
+
+            if not customer.get('PaymentTerm'):
+                metrics['customers']['missing_payment_terms'].append({'name': name})
+
+            if customer.get('IsOnCreditHold'):
+                metrics['customers']['on_credit_hold'].append({'name': name})
 
     # Check suppliers
+    # NOTE: Contacts are in a nested 'Contacts' array, NOT top-level fields
     if suppliers:
         for supplier in suppliers:
             name = supplier.get('Name', 'Unknown')
+            contacts = supplier.get('Contacts', []) or []
 
-            if not supplier.get('Email'):
+            has_email = any(c.get('Email') for c in contacts)
+            has_phone = any(c.get('Phone') or c.get('MobilePhone') for c in contacts)
+
+            if not has_email:
                 metrics['suppliers']['missing_email'].append({'name': name})
+
+            if not has_phone:
+                metrics['suppliers']['missing_phone'].append({'name': name})
+
+            if not supplier.get('PaymentTerm'):
+                metrics['suppliers']['missing_payment_terms'].append({'name': name})
 
     # Summary counts
     metrics['summary'] = {
         'products_no_price': len(metrics['products']['no_price']),
-        'products_no_category': len(metrics['products']['no_category']),
+        'products_no_barcode': len(metrics['products']['no_barcode']),
         'customers_missing_email': len(metrics['customers']['missing_email']),
+        'customers_missing_phone': len(metrics['customers']['missing_phone']),
+        'customers_missing_payment_terms': len(metrics['customers']['missing_payment_terms']),
+        'customers_on_credit_hold': len(metrics['customers']['on_credit_hold']),
         'suppliers_missing_email': len(metrics['suppliers']['missing_email']),
+        'suppliers_missing_phone': len(metrics['suppliers']['missing_phone']),
+        'suppliers_missing_payment_terms': len(metrics['suppliers']['missing_payment_terms']),
         'total_issues': (
             len(metrics['products']['no_price']) +
-            len(metrics['products']['no_category']) +
+            len(metrics['products']['no_barcode']) +
             len(metrics['customers']['missing_email']) +
-            len(metrics['suppliers']['missing_email'])
+            len(metrics['customers']['missing_phone']) +
+            len(metrics['customers']['missing_payment_terms']) +
+            len(metrics['customers']['on_credit_hold']) +
+            len(metrics['suppliers']['missing_email']) +
+            len(metrics['suppliers']['missing_phone']) +
+            len(metrics['suppliers']['missing_payment_terms'])
         )
     }
 
