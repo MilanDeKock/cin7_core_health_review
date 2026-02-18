@@ -19,32 +19,28 @@ load_dotenv()
 
 ENDPOINT_CHOICE = "2"   # 1=Sales, 2=Purchases, 3=Transfers, 4=Assemblies, 5=Production
 
-DESCRIPTION = "Auth POs — prior periods, not received (inspect EXTRA)"
+DESCRIPTION = "PO Billing (with IsServiceOnly fix)"
 
-from datetime import date, timedelta
-_period_start = date(2026, 2, 1).isoformat()
-_lookback = (date(2026, 2, 1) - timedelta(days=365)).isoformat()
-
-_UI_POS = {
-    'PO-00212','PO-00224','PO-00230','PO-00235','PO-00245','PO-00246','PO-00247','PO-00248',
-    'PO-00261','PO-00270','PO-00278','PO-00277','PO-00276','PO-00280','PO-00284','PO-00287',
-    'PO-00291','PO-00301','PO-00304','PO-00306','PO-00290','PO-00318','PO-00325','PO-00342',
-    'PO-00360','PO-00361','PO-00362','PO-00382','PO-00383',
+UI_PO_NUMBERS = {
+    'SPO000406','SPO000554','SPO000612','SPO000614',
+    'SPO000621','SPO000626','SPO000629','SPO000631',
+    'SPO000632','SPO000634','SPO000635','SPO000641',
+    'SPO000642','SPO000646',
 }
 
 def match(record):
-    order_date = record.get('OrderDate') or ''
-    in_filter = (
-        record.get('Status') in ('INVOICED', 'ORDERED', 'ORDERING', 'PARTIALLY INVOICED', 'RECEIVING')
-        and record.get('OrderStatus') in ('AUTHORISED', 'DRAFT')
-        and record.get('InvoiceStatus') in ('AUTHORISED', 'DRAFT', 'NOT AVAILABLE')
-        and record.get('CombinedReceivingStatus') in ('', 'NOT AVAILABLE', 'NOT RECEIVED', 'PARTIALLY RECEIVED')
-        and _lookback <= order_date < _period_start
+    status = record.get('Status', '')
+    comb_recv = record.get('CombinedReceivingStatus', '')
+    return (
+        record.get('OrderStatus') in ('AUTHORISED', 'RECEIVED')
+        and record.get('CombinedInvoiceStatus') in ('NOT INVOICED', 'PARTIALLY INVOICED', 'PARTIALLY INVOICED / CREDITED')
+        and status not in ('COMPLETED', 'VOIDED', 'INVOICED', 'CREDITED',
+                           'COMPLETED / CREDIT NOTE CLOSED')
+        and not (status == 'ORDERED' and comb_recv in ('NOT RECEIVED', 'NOT AVAILABLE', '')
+                 and not record.get('IsServiceOnly'))
     )
-    return in_filter and record.get('OrderNumber') not in _UI_POS
 
-# Empty → show distinct field values of the EXTRA POs
-SHOW_FIELDS = []
+SHOW_FIELDS = ['OrderNumber', 'OrderStatus', 'CombinedInvoiceStatus', 'Status', 'IsServiceOnly']
 
 
 
@@ -77,31 +73,55 @@ def main():
     print(f"\nFilter:   {DESCRIPTION}")
     print(f"Matched:  {len(matched)} raw records  |  {unique_pos} unique PO numbers  (compare unique to Cin7 UI)")
 
-    # If SHOW_FIELDS is empty and no UI list, show distinct values for key fields
-    if not SHOW_FIELDS and not globals().get('UI_PO_NUMBERS') and not globals().get('UI_SO_NUMBERS'):
-        for field in ['Status', 'OrderStatus', 'InvoiceStatus', 'CombinedInvoiceStatus', 'CombinedReceivingStatus']:
-            vals = sorted({str(r.get(field, '')) for r in matched})
-            print(f"  {field}: {vals}")
-        return
-
     # If UI reference list provided, show found/missing/extra
     ui_numbers = globals().get('UI_PO_NUMBERS') or globals().get('UI_SO_NUMBERS')
     if ui_numbers:
         matched_numbers = {r.get('OrderNumber') for r in matched}
-        found = ui_numbers & matched_numbers
-        missing = ui_numbers - matched_numbers
-        extra = matched_numbers - ui_numbers
+        ui_len = len(next(iter(ui_numbers)))
+        api_len = len(next(iter(matched_numbers))) if matched_numbers else ui_len
+        if api_len > ui_len:
+            matched_short = {on[:ui_len] for on in matched_numbers}
+            found = ui_numbers & matched_short
+            missing = ui_numbers - matched_short
+            extra = matched_short - ui_numbers
+            print(f"\n(Comparing first {ui_len} chars of API numbers)")
+        else:
+            found = ui_numbers & matched_numbers
+            missing = ui_numbers - matched_numbers
+            extra = matched_numbers - ui_numbers
         print(f"\nUI reference count: {len(ui_numbers)}")
         print(f"Found in filter:    {len(found)}")
         print(f"MISSING from filter: {sorted(missing)}")
         print(f"EXTRA (not in UI):   {sorted(extra)}")
+
+        if missing:
+            print(f"\n--- MISSING ---")
+            for ui_num in sorted(missing):
+                for r in records:
+                    on = r.get('OrderNumber', '')
+                    compare_on = on[:ui_len] if api_len > ui_len else on
+                    if compare_on == ui_num:
+                        print(f"  {on}: Status={r.get('Status')}  OrderStatus={r.get('OrderStatus')}  CombInv={r.get('CombinedInvoiceStatus')}  CombRecv={r.get('CombinedReceivingStatus')}")
+                        break
+                else:
+                    print(f"  {ui_num}: NOT FOUND in API at all")
+        if extra and len(extra) <= 25:
+            print(f"\n--- EXTRA (not in UI) field comparison ---")
+            for r in matched:
+                on = r.get('OrderNumber', '')
+                compare_on = on[:ui_len] if api_len > ui_len else on
+                if compare_on in extra:
+                    print(f"  {on}: Status={r.get('Status')}  CombRecv={r.get('CombinedReceivingStatus')}  IsServiceOnly={r.get('IsServiceOnly')}")
     elif matched:
         if not SHOW_FIELDS:
-            # Dump ALL fields for inspection
-            for r in matched:
-                print(f"\n--- {r.get('OrderNumber')} ---")
-                for k, v in r.items():
-                    print(f"  {k}: {v}")
+            r = matched[0]
+            print(f"\n--- ALL FIELDS for {r.get('OrderNumber')} ---")
+            for k, v in r.items():
+                print(f"  {k}: {v}")
+            if len(matched) > 1:
+                print(f"\n--- OrderNumbers for all {len(matched)} matched ---")
+                for r in matched:
+                    print(f"  {r.get('OrderNumber')}")
         else:
             print(f"\nAll {len(matched)} matched records:")
             print("  " + " | ".join(f"{f:<20}" for f in SHOW_FIELDS))

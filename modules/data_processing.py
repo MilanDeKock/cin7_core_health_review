@@ -130,9 +130,15 @@ def process_sales_metrics(
 
     # Compute dashboard status counts client-side
     computed_counts = {
-        'draft_quotes': len([s for s in active_sales if s.get('QuoteStatus') == 'DRAFT' and s.get('OrderStatus') == 'DRAFT']),
+        'draft_quotes': len([
+            s for s in sales_data  # no date cutoff — UI shows all historical
+            if s.get('Status') in ('DRAFT', 'ESTIMATING')
+        ]),
         'pending_orders': len([s for s in sales_data if s.get('Status') in ('DRAFT', 'ORDERING', 'ESTIMATED')]),
-        'backordered': len([s for s in active_sales if s.get('Status') == 'BACKORDERED']),
+        'backordered': len([
+            s for s in sales_data  # no date cutoff — UI shows all historical
+            if s.get('Status') == 'BACKORDERED'
+        ]),
         'awaiting_fulfilment': len([
             s for s in sales_data  # no date cutoff — UI shows all historical
             if s.get('FulFilmentStatus') in ('NOT FULFILLED', 'PARTIALLY FULFILLED')
@@ -148,12 +154,11 @@ def process_sales_metrics(
             and s.get('CreditNoteStatus') != 'AUTHORISED'
         ]),
         'awaiting_approval': len([
-            s for s in sales_data  # includes 365-day cutoff; UI may show ~1 more due to internal logic
+            s for s in sales_data  # no date cutoff — UI shows all historical
             if s.get('QuoteStatus') == 'AUTHORISED'
             and s.get('OrderStatus') == 'NOT AVAILABLE'
             and s.get('Status') not in ('COMPLETED', 'VOIDED', 'INVOICED')
             and s.get('CombinedInvoiceStatus') != 'INVOICED'
-            and (s.get('OrderDate') or '') >= (date.today() - timedelta(days=365)).isoformat()
         ]),
     }
 
@@ -281,12 +286,20 @@ def process_purchase_metrics(
 
     # Compute dashboard status counts client-side
     computed_counts = {
-        'draft': len([p for p in active_purchases if p.get('OrderStatus') == 'DRAFT']),
+        'draft': len([
+            p for p in purchases_data  # no date cutoff — UI shows all historical
+            if p.get('OrderStatus') == 'DRAFT'
+            and p.get('Status') != 'VOIDED'
+        ]),
         'billing': len([
             p for p in purchases_data  # no date cutoff — UI shows all historical
-            if p.get('OrderStatus') == 'AUTHORISED'
-            and p.get('CombinedInvoiceStatus') in ('NOT INVOICED', 'PARTIALLY INVOICED')
-            and p.get('Status') != 'VOIDED'
+            if p.get('OrderStatus') in ('AUTHORISED', 'RECEIVED')
+            and p.get('CombinedInvoiceStatus') in ('NOT INVOICED', 'PARTIALLY INVOICED', 'PARTIALLY INVOICED / CREDITED')
+            and p.get('Status') not in ('COMPLETED', 'VOIDED', 'INVOICED', 'CREDITED',
+                                        'COMPLETED / CREDIT NOTE CLOSED')
+            and not (p.get('Status') == 'ORDERED'
+                     and p.get('CombinedReceivingStatus') in ('NOT RECEIVED', 'NOT AVAILABLE', '')
+                     and not p.get('IsServiceOnly'))
         ]),
         'awaiting_delivery': len([
             p for p in purchases_data  # no date cutoff — UI shows all historical
@@ -335,47 +348,58 @@ def process_purchase_metrics(
         p for p in purchases_data
         if p.get('Status') in ('ORDERED', 'ORDERING', 'RECEIVED', 'RECEIVING')
         and p.get('InvoiceStatus') in ('DRAFT', 'NOT AVAILABLE')
-        and p.get('CombinedInvoiceStatus') in ('', 'NOT AVAILABLE', 'NOT INVOICED', 'PARTIALLY INVOICED')
+        and p.get('CombinedInvoiceStatus') in ('', 'NOT AVAILABLE', 'NOT INVOICED')
         and p.get('OrderStatus') != 'NOT AVAILABLE'
         and lookback_start <= (p.get('OrderDate') or '') < period_start
     ]
 
-    # Auth POs from prior periods, not received (12-month lookback, inclusive field filter)
+    # Auth POs from prior periods, not received (12-month lookback)
     prior_not_received = [
         p for p in purchases_data
         if p.get('Status') in ('INVOICED', 'ORDERED', 'ORDERING', 'PARTIALLY INVOICED', 'RECEIVING')
-        and p.get('OrderStatus') in ('AUTHORISED', 'DRAFT')
         and p.get('InvoiceStatus') in ('AUTHORISED', 'DRAFT', 'NOT AVAILABLE')
-        and p.get('CombinedReceivingStatus') in ('', 'NOT AVAILABLE', 'NOT RECEIVED', 'PARTIALLY RECEIVED')
+        and p.get('CombinedReceivingStatus') in ('', 'NOT AVAILABLE', 'NOT RECEIVED')
+        and p.get('OrderStatus') != 'NOT AVAILABLE'
         and lookback_start <= (p.get('OrderDate') or '') < period_start
     ]
 
-    # Auth POs from current period, not invoiced
+    # Auth POs from current period, not invoiced (same logic as prior, different date range)
     current_not_invoiced = [
-        p for p in authorised
-        if p.get('CombinedInvoiceStatus') in ('NOT INVOICED', 'PARTIALLY INVOICED')
+        p for p in purchases_data
+        if p.get('Status') in ('ORDERED', 'ORDERING', 'RECEIVED', 'RECEIVING')
+        and p.get('InvoiceStatus') in ('DRAFT', 'NOT AVAILABLE')
+        and p.get('CombinedInvoiceStatus') in ('', 'NOT AVAILABLE', 'NOT INVOICED')
+        and p.get('OrderStatus') != 'NOT AVAILABLE'
         and (p.get('OrderDate') or '') >= period_start
     ]
 
-    # Auth POs from current period, not received
+    # Auth POs from current period, not received (same logic as prior, different date range)
     current_not_received = [
-        p for p in authorised
-        if p.get('CombinedReceivingStatus') in ('NOT RECEIVED', 'PARTIALLY RECEIVED')
+        p for p in purchases_data
+        if p.get('Status') in ('INVOICED', 'ORDERED', 'ORDERING', 'PARTIALLY INVOICED', 'RECEIVING')
+        and p.get('InvoiceStatus') in ('AUTHORISED', 'DRAFT', 'NOT AVAILABLE')
+        and p.get('CombinedReceivingStatus') in ('', 'NOT AVAILABLE', 'NOT RECEIVED')
+        and p.get('OrderStatus') != 'NOT AVAILABLE'
         and (p.get('OrderDate') or '') >= period_start
     ]
 
-    # Fully invoiced but not fully received
+    # All authorised POs (base set for mismatch anomaly metrics)
+    authorised = [p for p in active_purchases if p.get('OrderStatus') == 'AUTHORISED']
+
+    # Fully invoiced but not fully received (365-day lookback)
     fully_invoiced_not_received = [
         p for p in authorised
         if p.get('CombinedInvoiceStatus') in ('INVOICED', 'INVOICED / CREDITED')
         and p.get('CombinedReceivingStatus') in ('NOT RECEIVED', 'PARTIALLY RECEIVED')
+        and (p.get('OrderDate') or '') >= lookback_start
     ]
 
-    # Fully received but not fully invoiced
+    # Fully received but not fully invoiced (365-day lookback)
     fully_received_not_invoiced = [
         p for p in authorised
         if p.get('CombinedReceivingStatus') == 'FULLY RECEIVED'
         and p.get('CombinedInvoiceStatus') in ('NOT INVOICED', 'PARTIALLY INVOICED')
+        and (p.get('OrderDate') or '') >= lookback_start
     ]
 
     metrics['anomalies'] = {
