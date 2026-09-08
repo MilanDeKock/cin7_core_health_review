@@ -1,286 +1,246 @@
-# Cin7 Core Health Check Automation
+# Cin7 Core Health Review
 
-Automated health check report generation for Cin7 Core (formerly DEAR Inventory) clients using the Cin7 API.
+Technical reference for the **Cin7 Core Health Review** tool — an internal Finovate
+utility that connects to the **Cin7 Core API** and produces a "health review" of a
+client's Cin7 Core setup (sales-order and purchase-order metrics, stock checks, and
+data-quality checks). It is a **Streamlit** app that runs on demand and shows the
+results in an interactive dashboard, with CSV export and (partially built) PDF export.
 
-**No CSV uploads required** – everything is pulled directly from the Cin7 Core API!
+> New to this tool and this practice? Read **`HANDOVER.md`** first — it explains what
+> the tool is, who depends on it, where it lives, and the ownership risks that must be
+> closed. This file is the feature-level reference for someone who already has the
+> context and wants to run, extend, or debug the code.
 
----
-
-## 🎯 What It Does
-
-This tool automatically:
-1. ✅ Connects to Cin7 Core API with client credentials
-2. ✅ Pulls all transaction data (sales, purchases, stock, transfers, etc.)
-3. ✅ Analyzes data to identify issues and anomalies
-4. ✅ Displays metrics in an interactive Streamlit dashboard
-5. 🚧 Generates branded PDF reports (coming soon)
-
----
-
-## 📋 Health Check Sections
-
-| Section | What It Checks | Status |
-|---------|---------------|--------|
-| **Sales Orders** | Status counts, anomalies (fulfilled not invoiced, etc.) | ✅ Implemented |
-| **Purchase Orders** | Status counts, anomalies (authorised not received, etc.) | ✅ Implemented |
-| **Stock Adjustments** | Discrepancies by location, top adjustments IN/OUT | ✅ Implemented |
-| **Stock Takes** | Discrepancies, cost impact per location | ✅ Implemented |
-| **Transfers** | Status counts, oldest transfers | ✅ Implemented |
-| **Assemblies & Production** | Status counts for assemblies and production orders | ✅ Implemented |
-| **Stock per Location** | Stock levels, negative stock detection | ✅ Implemented |
-| **Data Hygiene** | Products with no price/category, customer/supplier data quality | ✅ Implemented |
-| **Credit Notes** | Sale and purchase credit note analysis | ✅ Implemented |
-| **PDF Export** | Branded PDF report generation | 🚧 Coming in Phase 2 |
+**No CSV uploads required for the core review** — everything is pulled directly from the
+Cin7 Core API. (One optional section, Xero/QBO Sync Errors, does take a manual XLSX
+export because that data is not exposed by the API.)
 
 ---
 
-## 🚀 Quick Start
+## What it is
 
-### 1. Install Python
+- **Cin7 Core** (formerly **DEAR Inventory**) is a cloud inventory-management system.
+  Its API base URL is still on the legacy `dearsystems.com` domain
+  (`https://inventory.dearsystems.com/ExternalApi/v2`).
+- **Finovate** is a South African finance / accounting practice. This tool is used
+  internally by Finovate to review the state of a client's Cin7 Core account —
+  spotting stuck orders, un-invoiced fulfilments, negative stock, missing master
+  data, and similar issues — as part of a periodic (monthly) client health review.
+- It is a **read-only** tool. The credentials it uses are read-only API keys; it never
+  writes back to Cin7 Core.
 
-Make sure Python 3.10+ is installed:
+---
+
+## What it does
+
+1. Connects to the Cin7 Core API using a selected client's credentials.
+2. Pulls transaction and master data (sales, purchases, stock adjustments, stock takes,
+   transfers, assemblies/production, stock availability, products, customers, suppliers,
+   credit notes).
+3. Analyses the data to compute status counts and flag anomalies / data-quality issues.
+4. Displays everything in an interactive Streamlit dashboard (Summary, Detailed Metrics,
+   Anomalies, Generate PDF, Export Data tabs).
+5. Lets the user download the underlying tables as CSV. PDF export exists but is
+   **not fully finished** — see *Current state* below.
+
+### Review sections
+
+| Section | What it checks |
+|---|---|
+| **Sales Orders** | Status counts; anomalies (authorised prior-period not fulfilled, fulfilled not invoiced, invoiced not fulfilled) |
+| **Purchase Orders** | Status counts; anomalies (prior/current period not invoiced / not received, invoiced-not-received, received-not-invoiced) |
+| **Stock Adjustments** | Adjustments in the reporting period, cost impact, by-location breakdown, top qty in/out |
+| **Stock Takes** | Discrepancies and cost impact per location |
+| **Transfers** | Active transfers only (DRAFT + IN TRANSIT) |
+| **Assemblies & Production** | Status counts for assemblies and production orders (off by default) |
+| **Stock per Location** | Stock levels per location, negative-stock detection |
+| **Data Hygiene** | Sellable products with no price / no barcode; customers & suppliers missing email / phone / payment terms; customers on credit hold (off by default) |
+| **Credit Notes** | Sale and purchase credit-note analysis (off by default) |
+| **Xero/QBO Sync Errors** | **Optional, manual** — parsed from an uploaded XLSX export (not available via API) |
+
+---
+
+## How it authenticates to Cin7 Core
+
+Authentication is **per client**, using two Cin7 Core credentials sent as HTTP headers
+on every request:
+
+| Header sent to Cin7 | Sourced from env var | Meaning |
+|---|---|---|
+| `api-auth-accountid` | `CLIENT_<n>_ACCOUNT_ID` | The client's Cin7 Core **Account ID** |
+| `api-auth-applicationkey` | `CLIENT_<n>_API_KEY` | The client's Cin7 Core **API Application Key** |
+
+A friendly label for each client is read from `CLIENT_<n>_NAME`.
+
+- These are the standard Cin7 Core "External API" credentials. In Cin7 Core they are
+  found under **Settings → Integrations → API** (Account ID + Application Key).
+- **Multi-client by design.** Credentials are numbered `CLIENT_1_…`, `CLIENT_2_…`,
+  `CLIENT_3_…` and so on. In the app you pick a **Client Number** in the sidebar and
+  the client at that slot is loaded (`Cin7APIClient(client_number=n)` reads
+  `CLIENT_<n>_ACCOUNT_ID` / `CLIENT_<n>_API_KEY` from the environment).
+- There is **no OAuth, no login screen, no per-user auth** — whoever runs the app has
+  the client keys that are present in the environment. Keys should be read-only.
+
+> **Never commit the `.env` file or print key values.** `.env` is git-ignored. The names
+> above are all you need to document; the values belong only in the runtime environment.
+
+### To add a new client
+
+Add three more variables to the environment, incrementing the number:
+
+```
+CLIENT_4_NAME=<friendly client name>
+CLIENT_4_ACCOUNT_ID=<the client's Cin7 Core Account ID>
+CLIENT_4_API_KEY=<the client's Cin7 Core API Application Key>
+```
+
+Then select **Client Number 4** in the sidebar.
+
+---
+
+## Quick start (local)
+
 ```bash
+# 1. Python 3.10+ recommended
 python --version
-```
 
-### 2. Install Dependencies
-
-```bash
+# 2. Install dependencies
 pip install -r requirements.txt
-```
 
-### 3. Configure Client Credentials
+# 3. Create a .env file (see "How it authenticates" above) with at least CLIENT_1_*
 
-Edit `.env` file with your Cin7 Core API credentials:
+# 4. (Optional) sanity-check the API connection for client 1
+python test_api_client.py
 
-```bash
-# Client 1
-CLIENT_1_NAME=OTT
-CLIENT_1_ACCOUNT_ID=your-account-id-here
-CLIENT_1_API_KEY=your-api-key-here
-
-# Client 2
-CLIENT_2_NAME=Another Client
-CLIENT_2_ACCOUNT_ID=their-account-id
-CLIENT_2_API_KEY=their-api-key
-```
-
-**Where to find credentials:**
-1. Log into Cin7 Core
-2. Go to **Settings** → **Integrations** → **API**
-3. Copy your **Account ID** and **API Key**
-
-### 4. Run the Streamlit App
-
-```bash
+# 5. Run the app
 streamlit run app.py
+# opens at http://localhost:8501
 ```
 
-The app will open in your browser at `http://localhost:8501`
+In the app: pick a **Client Number**, choose the **report month/year**, tick the
+**sections** to include, optionally upload the Sync Error XLSX, then click
+**Load Data from Cin7**. A full pull takes roughly **2–3 minutes** because of API rate
+limiting.
 
 ---
 
-## 📖 How to Use
-
-### In the Streamlit App:
-
-1. **Select Client** – Choose client number (1, 2, 3, etc.) from sidebar
-2. **Choose Report Period** – Select month and year
-3. **Select Sections** – Check which sections to include in the health check
-4. **Click "Load Data from Cin7"** – The app will:
-   - Connect to Cin7 API
-   - Pull all data (takes 2-3 minutes due to rate limiting)
-   - Process metrics
-   - Display results
-
-5. **Review Results** – Use the tabs to explore:
-   - 📊 **Summary** – High-level metrics at a glance
-   - 📋 **Detailed Metrics** – Full breakdown per section
-   - 🔍 **Anomalies** – Issues that need attention
-   - 📄 **Generate PDF** – Export report (coming soon)
-
----
-
-## 🗂️ Project Structure
+## Project structure
 
 ```
 cin7_core_health_review/
-├── .env                    # API credentials (DO NOT commit to Git!)
-├── .gitignore             # Excludes .env from version control
-├── app.py                 # Main Streamlit application
-├── requirements.txt       # Python dependencies
-├── README.md              # This file
+├── .env                     # Per-client Cin7 credentials (GIT-IGNORED, never commit)
+├── .gitignore               # Ignores .env, outputs/, *.pdf, caches, .claude/
+├── app.py                   # Streamlit UI + orchestration of the data pull
+├── requirements.txt         # Python dependencies
+├── README.md                # This file (technical reference)
+├── HANDOVER.md              # Stranger-facing hand-off pack (read this first)
 │
 ├── modules/
-│   ├── api_client.py      # Cin7 API wrapper (pagination, rate limiting)
-│   ├── data_processing.py # Metrics calculation and analysis
-│   ├── pdf_generator.py   # PDF report generation (placeholder)
-│   └── ui_filters.py      # Date filtering helpers (optional)
+│   ├── api_client.py        # Cin7APIClient: auth, rate limiting, pagination, retries
+│   ├── data_processing.py   # All metric/anomaly calculations per section
+│   ├── pdf_generator.py     # PDF report generation (xhtml2pdf) — WIP
+│   └── ui_filters.py        # Date-range filter helpers (optional)
 │
-└── test files/
-    ├── test_api_client.py       # Basic API connection tests
-    ├── test_with_ui_filters.py  # Test with date filters
-    └── investigate_drafts.py    # Debug tool for draft order counts
+├── analyze_api_fields.py    # Dev tool: dumps unique values of key fields per endpoint
+├── analyze_status_combos.py # Dev tool: exports every unique status-field combination
+├── inspect_endpoint.py      # Dev tool: prints raw sample records for one endpoint
+├── investigate_drafts.py    # Dev tool: explains API vs UI draft-PO count differences
+├── test_api_client.py       # Basic API connection test
+├── test_filter.py           # Filter experiments
+├── test_stock_adjustment.py # Stock-adjustment endpoint experiments
+├── test_with_ui_filters.py  # Test pulls with date filters
+└── outputs/                 # Generated CSVs from the dev/analysis scripts (git-ignored)
 ```
 
----
-
-## 🛠️ Development Workflow
-
-### Testing API Connection
-
-Before running the full app, test your API credentials:
-
-```bash
-python test_api_client.py
-```
-
-This will verify:
-- ✅ API credentials are correct
-- ✅ You can connect to Cin7 Core
-- ✅ Basic data retrieval works
-
-### Investigating Discrepancies
-
-If counts don't match the Cin7 UI:
-
-```bash
-python investigate_drafts.py
-```
-
-This shows all draft POs with dates, helping you understand why the API might return more records than the UI shows (usually due to old/archived orders).
+The `analyze_*`, `inspect_*`, `investigate_*` and `test_*` scripts are **developer /
+calibration tools**, not part of the running app. They exist because a lot of the work
+was reconciling API results against what the Cin7 Core UI shows (draft/archived orders,
+status-field semantics). They are safe to keep for future calibration but are not needed
+to run the review.
 
 ---
 
-## 📊 API Coverage
+## The API client (`modules/api_client.py`)
 
-**Fully automated (no CSV needed):**
-- ✅ Sales Orders (all statuses, anomalies)
-- ✅ Purchase Orders (all statuses, anomalies)
-- ✅ Stock Adjustments (with line-level detail)
-- ✅ Stock Takes (with discrepancies)
-- ✅ Transfers (all statuses)
-- ✅ Assemblies & Production Orders
-- ✅ Stock Availability per Location
-- ✅ Product Master Data
-- ✅ Customer & Supplier Data
-- ✅ Credit Notes
+`Cin7APIClient` wraps the Cin7 Core External API v2. Key behaviours:
 
-**Not available via API:**
-- ❌ Xero/QBO Sync Errors (would need CSV export or screen scrape)
+- **Base URL:** `https://inventory.dearsystems.com/ExternalApi/v2`
+- **Auth:** the two `api-auth-*` headers described above, per client.
+- **Rate limiting:** Cin7 Core allows **60 calls/minute**. The client self-throttles to
+  ~1 call/second (`RATE_LIMIT_DELAY = 1.0`).
+- **Retries:** transient errors (429, 500, 503, network) are retried up to `MAX_RETRIES`
+  (3) with a delay. 400/403/404 are raised as `Cin7APIError`.
+- **Pagination:** list endpoints are auto-paginated until all records are retrieved.
+- **Helpers:** convenience methods for status counts and each health-check section (see
+  **`API_CLIENT_README.md`** for the full method reference).
 
----
-
-## ⚙️ Configuration Options
-
-### Date Filtering (Optional)
-
-By default, the app shows **all data** (including old/archived records) for full transparency.
-
-If you want to filter by date to match the Cin7 UI:
-
-```python
-from modules.ui_filters import UIFilters
-
-filters = UIFilters()
-
-# Get only recent orders
-purchases = client.get_purchase_list(
-    order_status="DRAFT",
-    modified_since=filters.last_90_days  # Only last 90 days
-)
-```
-
-Available filters:
-- `filters.last_30_days`
-- `filters.last_60_days`
-- `filters.last_90_days`
-- `filters.current_month`
-- `filters.last_365_days`
+`API_CLIENT_README.md` is the detailed method-by-method reference for this client.
 
 ---
 
-## 🔒 Security
+## Configuration / environment variables
 
-**IMPORTANT:**
-- ✅ `.env` file is in `.gitignore` – it won't be committed to Git
-- ✅ Never share your `.env` file or API credentials
-- ✅ API credentials have read-only access (cannot modify data)
+Only the per-client Cin7 credentials are required. Names only (values never committed):
 
----
+| Variable | Required | Purpose |
+|---|---|---|
+| `CLIENT_<n>_NAME` | recommended | Friendly label for client slot `n` |
+| `CLIENT_<n>_ACCOUNT_ID` | **yes** | Client `n` Cin7 Core Account ID (`api-auth-accountid`) |
+| `CLIENT_<n>_API_KEY` | **yes** | Client `n` Cin7 Core API Application Key (`api-auth-applicationkey`) |
 
-## 📈 Performance
-
-- **Rate Limit:** 60 API calls per minute (enforced automatically)
-- **Typical Runtime:** 2-3 minutes for a full health check
-- **Data Volume:** Handles 1000s of transactions with pagination
+`n` starts at 1 and increments per client. The sidebar allows client numbers 1–10.
 
 ---
 
-## 🚧 Roadmap
+## Current state & known limitations
 
-### Phase 1 (✅ Complete)
-- ✅ API client with all health check endpoints
-- ✅ Data processing for all sections
-- ✅ Streamlit UI with interactive dashboard
-
-### Phase 2 (Next)
-- 🚧 PDF generation (branded reports matching Finovate style)
-- 🚧 Historical tracking (compare month-over-month)
-- 🚧 RAG health score (Red/Amber/Green status per section)
-
-### Phase 3 (Future)
-- 🚧 Scheduled monthly runs with email delivery
-- 🚧 Multi-client dashboard (compare across clients)
-- 🚧 Anomaly alerts and recommendations
-
----
-
-## 🐛 Troubleshooting
-
-### "Authentication Failed (403)"
-- Check your Account ID and API Key in `.env`
-- Verify credentials in Cin7 Core: Settings → Integrations → API
-
-### "Rate limit exceeded (429)"
-- The client automatically retries
-- If persistent, wait a few minutes and try again
-
-### "ModuleNotFoundError"
-- Run: `pip install -r requirements.txt`
-
-### Counts don't match Cin7 UI
-- The API returns **all records** (including old/archived)
-- The UI may have date filters active
-- Run `python investigate_drafts.py` to see what the API is returning
-
-### Streamlit command not found
-- Make sure streamlit is installed: `pip install streamlit`
-- Try: `python -m streamlit run app.py`
+- **PDF export is work-in-progress.** The UI has a "Generate PDF" tab and
+  `modules/pdf_generator.py` exists (xhtml2pdf), but this path is not fully finished /
+  verified. Treat CSV export as the reliable output.
+- **Assemblies, Data Hygiene, and Credit Notes are off by default** in the sidebar; tick
+  them to include them.
+- **Sync Errors are manual.** Xero/QBO sync errors are not in the Cin7 Core API, so that
+  section only appears if you upload the XLSX export from Cin7 (Reports → Xero/QBO
+  Synchronisation Report). The parser skips the first 6 header rows (`header=6`).
+- **API vs UI count differences are expected.** The API returns all records (including
+  old/archived); the Cin7 UI often has date filters. `investigate_drafts.py` exists to
+  explain the difference. Several commits ("Fix SO and PO metric filters to match Cin7
+  UI", "Calibrate PO anomaly filters") were specifically to reconcile these — be careful
+  changing the filter logic in `data_processing.py`.
+- Leftover `modules/data_processing.py.tmp.*` files are editor temp files and can be
+  deleted; the live module is `modules/data_processing.py`.
+- **No automated tests / CI.** The `test_*.py` files are manual scripts, not a suite.
 
 ---
 
-## 📚 Documentation
+## Troubleshooting
 
-- [API_CLIENT_README.md](API_CLIENT_README.md) – Detailed API client documentation
-- [Cin7 API Docs](https://dearinventory.docs.apiary.io/) – Official Cin7 Core API reference
-
----
-
-## 📝 License
-
-Internal tool for Finovate. Not for public distribution.
-
----
-
-## 🙋 Support
-
-For issues or questions:
-1. Check the troubleshooting section above
-2. Review the logs in the terminal
-3. Test with `python test_api_client.py`
-4. Contact the development team
+| Symptom | Likely cause / fix |
+|---|---|
+| `Authentication Failed (403)` | Wrong/expired Account ID or API Key for that client. Re-check in Cin7 Core → Settings → Integrations → API. |
+| `Rate limit exceeded (429)` | The client auto-retries; if persistent, wait and re-run. Ensure a single client instance. |
+| `ModuleNotFoundError` | `pip install -r requirements.txt`. |
+| Counts don't match the Cin7 UI | The API returns all records incl. archived; the UI may be date-filtered. Run `python investigate_drafts.py`. |
+| `streamlit: command not found` | `pip install streamlit`, or run `python -m streamlit run app.py`. |
 
 ---
 
-**Built with ❤️ for Finovate clients**
+## Security
+
+- API credentials are **read-only** and must stay in `.env` (git-ignored) or the host's
+  secret store — never in code, never committed, never printed.
+- `.env` is listed in `.gitignore`; confirm it is untracked before any push.
+- See `HANDOVER.md` for the ownership / migration risks (personal GitHub account, and
+  any personal hosting account).
+
+---
+
+## Further reading
+
+- **`HANDOVER.md`** — hand-off pack (what it is, who depends on it, where it lives, risks).
+- **`API_CLIENT_README.md`** — full `Cin7APIClient` method reference and response shapes.
+- [Cin7 Core (DEAR) API docs](https://dearinventory.docs.apiary.io/) — official reference.
+
+---
+
+*Internal tool for Finovate. Not for public distribution.*
